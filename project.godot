@@ -1,0 +1,12 @@
+; Minimalny projekt serwera pod Railway.
+config_version=5
+
+[application]
+config/name="Redline Railway Server"
+run/main_scene="res://dedicated_server.tscn"
+config/features=PackedStringArray("4.6")
+
+[display]
+window/size/viewport_width=640
+window/size/viewport_height=360
+
