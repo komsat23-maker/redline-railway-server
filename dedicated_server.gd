@@ -1,0 +1,444 @@
+extends Node
+
+const SERVER_BUILD_TAG := "DUEL_NET_V4_2026-03-14"
+const ONLINE_MAX_PLAYERS: int = 2
+const SERVER_MAX_HP: int = 100
+const HIT_RADIUS_PX: float = 22.0
+const KILL_REWARD_PVP: int = 500
+const START_MONEY_PVP: int = 800
+const ARMOR_PRICE_PVP: int = 650
+const MAG_PRICE_PVP: int = 100
+const UNLOCK_AK_PRICE_PVP: int = 1800
+const UNLOCK_GLOCK_PRICE_PVP: int = 900
+const MAX_SPARE_MAGS_PER_WEAPON_PVP: int = 5
+const AK_CLIP_SIZE_PVP: int = 30
+const GLOCK_CLIP_SIZE_PVP: int = 20
+const AK_RELOAD_SEC_PVP: float = 2.1
+const GLOCK_RELOAD_SEC_PVP: float = 1.6
+const WEAPON_DAMAGE: Dictionary = {"ak": 20, "glock": 10}
+const WEAPON_RANGE: Dictionary = {"ak": 1300.0, "glock": 1100.0}
+
+@export var port: int = 2457
+
+var server_states: Dictionary = {}
+var server_names: Dictionary = {}
+
+
+func _ready() -> void:
+	var env_port := int(OS.get_environment("PORT"))
+	if env_port > 0:
+		port = env_port
+	var peer := WebSocketMultiplayerPeer.new()
+	var err := peer.create_server(port)
+	if err != OK:
+		push_error("Server start failed: %s" % error_string(err))
+		get_tree().quit()
+		return
+	multiplayer.multiplayer_peer = peer
+	multiplayer.peer_connected.connect(_on_peer_connected)
+	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	print("Redline dedicated websocket server listening on port %d [%s]" % [port, SERVER_BUILD_TAG])
+
+
+func _on_peer_connected(id: int) -> void:
+	if server_states.size() >= ONLINE_MAX_PLAYERS:
+		if multiplayer.multiplayer_peer != null:
+			multiplayer.multiplayer_peer.disconnect_peer(id)
+		print("Peer rejected (max players reached): %d" % id)
+		return
+	_server_ensure_peer(id)
+	_server_broadcast_state()
+	print("Peer connected: %d" % id)
+
+
+func _on_peer_disconnected(id: int) -> void:
+	print("Peer disconnected: %d" % id)
+	_server_drop_peer(id)
+	if _can_send_rpc_to_peers():
+		rpc("net_remove_peer", id)
+	_server_broadcast_state()
+
+
+func _spawn_for_index(idx: int) -> Vector2:
+	if idx % 2 == 0:
+		return Vector2(-220.0, 0.0)
+	return Vector2(220.0, 0.0)
+
+
+func _server_ensure_peer(peer_id: int) -> void:
+	if server_states.has(peer_id):
+		return
+	var idx := server_states.size()
+	var spawn := _spawn_for_index(idx)
+	server_states[peer_id] = {
+		"x": spawn.x,
+		"y": spawn.y,
+		"aim": 0.0,
+		"weapon": "glock",
+		"hp": SERVER_MAX_HP,
+		"armor": 100,
+		"money": START_MONEY_PVP,
+		"ak_clip": AK_CLIP_SIZE_PVP,
+		"ak_mags": 0,
+		"ak_reload_end": 0.0,
+		"glock_clip": GLOCK_CLIP_SIZE_PVP,
+		"glock_mags": 1,
+		"glock_reload_end": 0.0,
+		"ak_owned": false,
+		"glock_owned": true
+	}
+	server_names[peer_id] = "P%d" % peer_id
+
+
+func _server_set_name(peer_id: int, nick: String) -> void:
+	_server_ensure_peer(peer_id)
+	var clean := nick.strip_edges()
+	if clean == "":
+		clean = "P%d" % peer_id
+	if clean.length() > 16:
+		clean = clean.substr(0, 16)
+	server_names[peer_id] = clean
+
+
+func _server_weapon_owned(state: Dictionary, weapon_id: String) -> bool:
+	match weapon_id:
+		"ak":
+			return bool(state.get("ak_owned", false))
+		"glock":
+			return bool(state.get("glock_owned", true))
+		"knife", "grenade":
+			return true
+		_:
+			return false
+
+
+func _server_now_sec() -> float:
+	return Time.get_ticks_msec() * 0.001
+
+
+func _server_finalize_reload_for_weapon(state: Dictionary, weapon_id: String, now_sec: float) -> bool:
+	match weapon_id:
+		"ak":
+			var end_ak := float(state.get("ak_reload_end", 0.0))
+			if end_ak <= 0.0 or now_sec < end_ak:
+				return false
+			var clip_ak := int(state.get("ak_clip", AK_CLIP_SIZE_PVP))
+			var mags_ak := int(state.get("ak_mags", 0))
+			if clip_ak < AK_CLIP_SIZE_PVP and mags_ak > 0:
+				state["ak_clip"] = AK_CLIP_SIZE_PVP
+				state["ak_mags"] = mags_ak - 1
+			state["ak_reload_end"] = 0.0
+			return true
+		"glock":
+			var end_g := float(state.get("glock_reload_end", 0.0))
+			if end_g <= 0.0 or now_sec < end_g:
+				return false
+			var clip_g := int(state.get("glock_clip", GLOCK_CLIP_SIZE_PVP))
+			var mags_g := int(state.get("glock_mags", 1))
+			if clip_g < GLOCK_CLIP_SIZE_PVP and mags_g > 0:
+				state["glock_clip"] = GLOCK_CLIP_SIZE_PVP
+				state["glock_mags"] = mags_g - 1
+			state["glock_reload_end"] = 0.0
+			return true
+		_:
+			return false
+
+
+func _server_update_reloads_for_state(state: Dictionary, now_sec: float) -> bool:
+	var changed_ak := _server_finalize_reload_for_weapon(state, "ak", now_sec)
+	var changed_glock := _server_finalize_reload_for_weapon(state, "glock", now_sec)
+	return changed_ak or changed_glock
+
+
+func _server_is_weapon_reloading(state: Dictionary, weapon_id: String, now_sec: float) -> bool:
+	match weapon_id:
+		"ak":
+			return float(state.get("ak_reload_end", 0.0)) > now_sec
+		"glock":
+			return float(state.get("glock_reload_end", 0.0)) > now_sec
+		_:
+			return false
+
+
+func _server_apply_buy(peer_id: int, action_id: String) -> void:
+	_server_ensure_peer(peer_id)
+	if not server_states.has(peer_id):
+		return
+	var s: Dictionary = server_states[peer_id]
+	var money_now := int(s.get("money", START_MONEY_PVP))
+	match action_id:
+		"armor":
+			if money_now >= ARMOR_PRICE_PVP:
+				money_now -= ARMOR_PRICE_PVP
+				s["armor"] = 100
+		"mag_ak":
+			var mags_ak := int(s.get("ak_mags", 0))
+			if money_now >= MAG_PRICE_PVP and mags_ak < MAX_SPARE_MAGS_PER_WEAPON_PVP:
+				money_now -= MAG_PRICE_PVP
+				s["ak_mags"] = mags_ak + 1
+		"mag_glock":
+			var mags_g := int(s.get("glock_mags", 1))
+			if money_now >= MAG_PRICE_PVP and mags_g < MAX_SPARE_MAGS_PER_WEAPON_PVP:
+				money_now -= MAG_PRICE_PVP
+				s["glock_mags"] = mags_g + 1
+		"unlock_ak":
+			if (not bool(s.get("ak_owned", false))) and money_now >= UNLOCK_AK_PRICE_PVP:
+				money_now -= UNLOCK_AK_PRICE_PVP
+				s["ak_owned"] = true
+		"unlock_glock":
+			if (not bool(s.get("glock_owned", true))) and money_now >= UNLOCK_GLOCK_PRICE_PVP:
+				money_now -= UNLOCK_GLOCK_PRICE_PVP
+				s["glock_owned"] = true
+		_:
+			pass
+	s["money"] = maxi(0, money_now)
+	server_states[peer_id] = s
+
+
+func _server_apply_reload(peer_id: int, weapon_id: String) -> void:
+	_server_ensure_peer(peer_id)
+	if not server_states.has(peer_id):
+		return
+	var s: Dictionary = server_states[peer_id]
+	var now_sec := _server_now_sec()
+	var changed := _server_update_reloads_for_state(s, now_sec)
+	match weapon_id:
+		"ak":
+			if not bool(s.get("ak_owned", false)):
+				server_states[peer_id] = s
+				return
+			if _server_is_weapon_reloading(s, "ak", now_sec):
+				server_states[peer_id] = s
+				return
+			var clip_ak := int(s.get("ak_clip", AK_CLIP_SIZE_PVP))
+			var mags_ak := int(s.get("ak_mags", 0))
+			if clip_ak < AK_CLIP_SIZE_PVP and mags_ak > 0:
+				s["ak_reload_end"] = now_sec + AK_RELOAD_SEC_PVP
+				changed = true
+		"glock":
+			if not bool(s.get("glock_owned", true)):
+				server_states[peer_id] = s
+				return
+			if _server_is_weapon_reloading(s, "glock", now_sec):
+				server_states[peer_id] = s
+				return
+			var clip_g := int(s.get("glock_clip", GLOCK_CLIP_SIZE_PVP))
+			var mags_g := int(s.get("glock_mags", 1))
+			if clip_g < GLOCK_CLIP_SIZE_PVP and mags_g > 0:
+				s["glock_reload_end"] = now_sec + GLOCK_RELOAD_SEC_PVP
+				changed = true
+		_:
+			server_states[peer_id] = s
+			return
+	if changed:
+		server_states[peer_id] = s
+
+
+func _server_update_state(peer_id: int, state: Dictionary) -> void:
+	_server_ensure_peer(peer_id)
+	if not server_states.has(peer_id):
+		return
+	var s: Dictionary = server_states[peer_id]
+	s["x"] = float(state.get("x", s.get("x", 0.0)))
+	s["y"] = float(state.get("y", s.get("y", 0.0)))
+	s["aim"] = float(state.get("aim", s.get("aim", 0.0)))
+	var w := str(state.get("weapon", s.get("weapon", "glock")))
+	if not _server_weapon_owned(s, w):
+		w = "glock"
+	elif not (w == "ak" or w == "glock" or w == "knife" or w == "grenade"):
+		w = "glock"
+	s["weapon"] = w
+	server_states[peer_id] = s
+
+
+func _server_drop_peer(peer_id: int) -> void:
+	server_states.erase(peer_id)
+	server_names.erase(peer_id)
+
+
+func _server_build_snapshot() -> Dictionary:
+	var snapshot := {}
+	var now_sec := _server_now_sec()
+	for peer_id in server_states.keys():
+		var state_ref: Dictionary = server_states[peer_id]
+		if _server_update_reloads_for_state(state_ref, now_sec):
+			server_states[peer_id] = state_ref
+		var s: Dictionary = (server_states[peer_id] as Dictionary).duplicate(true)
+		s["nick"] = server_names.get(peer_id, "P%d" % peer_id)
+		s["ak_reload_left"] = maxf(0.0, float(s.get("ak_reload_end", 0.0)) - now_sec)
+		s["glock_reload_left"] = maxf(0.0, float(s.get("glock_reload_end", 0.0)) - now_sec)
+		snapshot[str(peer_id)] = s
+	return snapshot
+
+
+func _can_send_rpc_to_peers() -> bool:
+	if multiplayer.multiplayer_peer == null:
+		return false
+	if multiplayer.multiplayer_peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return false
+	return not multiplayer.get_peers().is_empty()
+
+
+func _server_broadcast_state() -> void:
+	if _can_send_rpc_to_peers():
+		rpc("net_receive_world_state", _server_build_snapshot())
+
+
+func _distance_point_to_ray(origin: Vector2, dir: Vector2, point: Vector2, max_range: float) -> float:
+	var to_p := point - origin
+	var t := to_p.dot(dir)
+	if t < 0.0 or t > max_range:
+		return 999999.0
+	var closest := origin + dir * t
+	return closest.distance_to(point)
+
+
+func _server_handle_shot(sender: int, payload: Dictionary) -> void:
+	_server_ensure_peer(sender)
+	if not server_states.has(sender):
+		return
+	var now_sec := _server_now_sec()
+	var shooter_state: Dictionary = server_states[sender]
+	if _server_update_reloads_for_state(shooter_state, now_sec):
+		server_states[sender] = shooter_state
+	var shooter_pos := Vector2(float(shooter_state.get("x", 0.0)), float(shooter_state.get("y", 0.0)))
+	var dir := Vector2(float(payload.get("dx", 0.0)), float(payload.get("dy", 0.0)))
+	if dir.length_squared() <= 0.0001:
+		return
+	dir = dir.normalized()
+	var weapon := str(payload.get("weapon", "glock"))
+	if not WEAPON_DAMAGE.has(weapon):
+		weapon = "glock"
+	if not _server_weapon_owned(shooter_state, weapon):
+		return
+	if _server_is_weapon_reloading(shooter_state, weapon, now_sec):
+		return
+	if weapon == "ak":
+		var ak_clip_now := int(shooter_state.get("ak_clip", AK_CLIP_SIZE_PVP))
+		if ak_clip_now <= 0:
+			return
+		var ak_after := ak_clip_now - 1
+		shooter_state["ak_clip"] = ak_after
+		if ak_after <= 0 and int(shooter_state.get("ak_mags", 0)) > 0 and not _server_is_weapon_reloading(shooter_state, "ak", now_sec):
+			shooter_state["ak_reload_end"] = now_sec + AK_RELOAD_SEC_PVP
+	elif weapon == "glock":
+		var glock_clip_now := int(shooter_state.get("glock_clip", GLOCK_CLIP_SIZE_PVP))
+		if glock_clip_now <= 0:
+			return
+		var glock_after := glock_clip_now - 1
+		shooter_state["glock_clip"] = glock_after
+		if glock_after <= 0 and int(shooter_state.get("glock_mags", 1)) > 0 and not _server_is_weapon_reloading(shooter_state, "glock", now_sec):
+			shooter_state["glock_reload_end"] = now_sec + GLOCK_RELOAD_SEC_PVP
+	server_states[sender] = shooter_state
+	var max_range := float(WEAPON_RANGE.get(weapon, 1000.0))
+	var victim_id: int = -1
+	var best_dist_along: float = 999999.0
+	for peer_id in server_states.keys():
+		if int(peer_id) == sender:
+			continue
+		var target_state: Dictionary = server_states[peer_id]
+		var target_pos := Vector2(float(target_state.get("x", 0.0)), float(target_state.get("y", 0.0)))
+		var to_target := target_pos - shooter_pos
+		var along := to_target.dot(dir)
+		if along < 0.0 or along > max_range:
+			continue
+		var dist := _distance_point_to_ray(shooter_pos, dir, target_pos, max_range)
+		if dist <= HIT_RADIUS_PX and along < best_dist_along:
+			best_dist_along = along
+			victim_id = int(peer_id)
+	if victim_id != -1:
+		var v: Dictionary = server_states[victim_id]
+		var dmg_total := int(WEAPON_DAMAGE[weapon])
+		var armor_now := int(v.get("armor", 0))
+		var absorbed := 0
+		if armor_now > 0:
+			absorbed = mini(armor_now, int(round(float(dmg_total) * 0.6)))
+			armor_now -= absorbed
+		var hp_loss := maxi(0, dmg_total - absorbed)
+		var hp_now := int(v.get("hp", SERVER_MAX_HP))
+		hp_now -= hp_loss
+		if hp_now <= 0:
+			hp_now = SERVER_MAX_HP
+			armor_now = 0
+			var spawn := _spawn_for_index(0 if victim_id % 2 == 0 else 1)
+			v["x"] = spawn.x
+			v["y"] = spawn.y
+		v["hp"] = clampi(hp_now, 0, SERVER_MAX_HP)
+		v["armor"] = clampi(armor_now, 0, 100)
+		server_states[victim_id] = v
+		if hp_now == SERVER_MAX_HP:
+			var shooter_money := int(shooter_state.get("money", START_MONEY_PVP)) + KILL_REWARD_PVP
+			shooter_state["money"] = shooter_money
+			server_states[sender] = shooter_state
+			if _can_send_rpc_to_peers():
+				rpc_id(sender, "net_award_kill_reward", KILL_REWARD_PVP)
+	if _can_send_rpc_to_peers():
+		rpc("net_spawn_shot_fx", sender, payload)
+	_server_broadcast_state()
+
+
+@rpc("any_peer")
+func net_ping(client_msec: int) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	if sender <= 0:
+		return
+	rpc_id(sender, "net_pong", client_msec)
+
+
+@rpc("authority", "call_local")
+func net_pong(_client_msec: int) -> void:
+	pass
+
+
+@rpc("any_peer")
+func net_submit_profile(profile: Dictionary) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	_server_set_name(sender, str(profile.get("nick", "Player")))
+	_server_broadcast_state()
+
+
+@rpc("any_peer", "unreliable")
+func net_submit_state(state: Dictionary) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	_server_update_state(sender, state)
+	_server_broadcast_state()
+
+
+@rpc("any_peer", "unreliable")
+func net_submit_shot(payload: Dictionary) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	_server_handle_shot(sender, payload)
+
+
+@rpc("any_peer")
+func net_submit_buy(action_id: String) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	_server_apply_buy(sender, action_id)
+	_server_broadcast_state()
+
+
+@rpc("any_peer")
+func net_submit_reload(weapon_id: String) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	_server_apply_reload(sender, weapon_id)
+	_server_broadcast_state()
+
+
+@rpc("authority", "call_local", "unreliable")
+func net_receive_world_state(_snapshot: Dictionary) -> void:
+	pass
+
+
+@rpc("authority", "call_local", "unreliable")
+func net_spawn_shot_fx(_peer_id: int, _payload: Dictionary) -> void:
+	pass
+
+
+@rpc("authority", "call_local")
+func net_award_kill_reward(_amount: int) -> void:
+	pass
+
+
+@rpc("authority", "call_local")
+func net_remove_peer(_peer_id: int) -> void:
+	pass
