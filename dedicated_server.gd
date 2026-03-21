@@ -1,7 +1,7 @@
 extends Node
 
 const SERVER_BUILD_TAG := "DUEL_NET_V4_2026-03-14"
-const ONLINE_MAX_PLAYERS: int = 2
+const ONLINE_MAX_PLAYERS: int = 12
 const SERVER_MAX_HP: int = 100
 const HIT_RADIUS_PX: float = 22.0
 const KILL_REWARD_PVP: int = 500
@@ -229,9 +229,12 @@ func _server_tick_round(delta: float) -> void:
 
 
 func _spawn_for_index(idx: int) -> Vector2:
-	if idx % 2 == 0:
-		return Vector2(-220.0, 0.0)
-	return Vector2(220.0, 0.0)
+	var slots_per_ring := 8
+	var ring := int(idx / slots_per_ring)
+	var slot := idx % slots_per_ring
+	var radius := 260.0 + float(ring) * 140.0
+	var angle := TAU * (float(slot) / float(slots_per_ring))
+	return Vector2(cos(angle), sin(angle)) * radius
 
 
 func _server_ensure_peer(peer_id: int) -> void:
@@ -239,13 +242,14 @@ func _server_ensure_peer(peer_id: int) -> void:
 		return
 	var idx := server_states.size()
 	var spawn := _spawn_for_index(idx)
+	var can_spawn_now := server_phase == "buy"
 	server_states[peer_id] = {
 		"x": spawn.x,
 		"y": spawn.y,
 		"aim": 0.0,
 		"weapon": "glock",
-		"hp": SERVER_MAX_HP,
-		"alive": true,
+		"hp": SERVER_MAX_HP if can_spawn_now else 0,
+		"alive": can_spawn_now,
 		"armor": 100,
 		"money": START_MONEY_PVP,
 		"ak_clip": AK_CLIP_SIZE_PVP,
@@ -456,16 +460,19 @@ func _server_build_snapshot() -> Dictionary:
 		s["nick"] = server_names.get(peer_id, "P%d" % peer_id)
 		s["ak_reload_left"] = maxf(0.0, float(s.get("ak_reload_end", 0.0)) - now_sec)
 		s["glock_reload_left"] = maxf(0.0, float(s.get("glock_reload_end", 0.0)) - now_sec)
-		var enemy_id := -1
+		var enemy_score_best := 0
+		var opponents := 0
 		for oid in ids:
-			if oid != int(peer_id):
-				enemy_id = oid
-				break
+			if oid == int(peer_id):
+				continue
+			opponents += 1
+			enemy_score_best = maxi(enemy_score_best, int(server_scores.get(oid, 0)))
 		s["phase"] = server_phase
 		s["phase_left"] = server_phase_time_left
 		s["wait_left"] = server_wait_time_left if server_phase == "waiting" else 0.0
 		s["score"] = int(server_scores.get(peer_id, 0))
-		s["enemy_score"] = int(server_scores.get(enemy_id, 0)) if enemy_id != -1 else 0
+		s["enemy_score"] = enemy_score_best
+		s["opponents"] = opponents
 		s["points_to_win"] = ONLINE_POINTS_TO_WIN
 		s["match_winner"] = server_match_winner
 		snapshot[str(peer_id)] = s
