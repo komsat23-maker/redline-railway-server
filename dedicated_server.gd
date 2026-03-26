@@ -28,8 +28,10 @@ const DB_PATH: String = "user://redline_accounts_db.json"
 const INV_CASE_ITEM_PREFIX: String = "item_case_rainbow"
 const INV_SKIN_ITEM_PREFIX: String = "item_skin"
 const RAINBOW_COLOR_ORDER: Array[String] = ["red", "blue", "green", "yellow"]
-const AUTH_LOGIN_MAX: int = 24
-const AUTH_PASSWORD_MAX: int = 64
+const AUTH_LOGIN_MIN: int = 3
+const AUTH_LOGIN_MAX: int = 16
+const AUTH_PASSWORD_MIN: int = 4
+const AUTH_PASSWORD_MAX: int = 16
 
 @export var port: int = 2457
 
@@ -512,7 +514,7 @@ func _server_tick_round(delta: float) -> void:
 
 func _spawn_for_index(idx: int) -> Vector2:
 	var slots_per_ring := 8
-	var ring := int(idx / slots_per_ring)
+	var ring := int(floor(float(idx) / float(maxi(1, slots_per_ring))))
 	var slot := idx % slots_per_ring
 	var radius := 260.0 + float(ring) * 140.0
 	var angle := TAU * (float(slot) / float(slots_per_ring))
@@ -633,7 +635,7 @@ func _server_apply_buy(peer_id: int, action_id: String) -> void:
 	var money_now := int(s.get("money", START_MONEY_PVP))
 	match action_id:
 		"armor":
-			if money_now >= ARMOR_PRICE_PVP:
+			if money_now >= ARMOR_PRICE_PVP and int(s.get("armor", 0)) < 100:
 				money_now -= ARMOR_PRICE_PVP
 				s["armor"] = 100
 		"grenade":
@@ -950,12 +952,11 @@ func net_submit_auth(payload: Dictionary) -> void:
 	if login == "" or password == "":
 		rpc_id(sender, "net_auth_result", false, "Brak loginu lub hasla.", {})
 		return
-	if login.length() > AUTH_LOGIN_MAX:
-		login = login.substr(0, AUTH_LOGIN_MAX)
-	if password.length() > AUTH_PASSWORD_MAX:
-		password = password.substr(0, AUTH_PASSWORD_MAX)
-	if password.length() < 3:
-		rpc_id(sender, "net_auth_result", false, "Haslo min. 3 znaki.", {})
+	if login.length() < AUTH_LOGIN_MIN or login.length() > AUTH_LOGIN_MAX:
+		rpc_id(sender, "net_auth_result", false, "Login: 3-16 znakow.", {})
+		return
+	if password.length() < AUTH_PASSWORD_MIN or password.length() > AUTH_PASSWORD_MAX:
+		rpc_id(sender, "net_auth_result", false, "Haslo: 4-16 znakow.", {})
 		return
 	for i in range(login.length()):
 		var ch := login.unicode_at(i)
@@ -963,9 +964,6 @@ func net_submit_auth(payload: Dictionary) -> void:
 		if not ok_char:
 			rpc_id(sender, "net_auth_result", false, "Login: tylko a-z 0-9 _", {})
 			return
-	if login.length() < 3:
-		rpc_id(sender, "net_auth_result", false, "Login min. 3 znaki.", {})
-		return
 
 	var users: Dictionary = account_db.get("users", {})
 	var pass_hash := _hash_password(password)
