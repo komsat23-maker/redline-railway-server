@@ -24,6 +24,12 @@ const ONLINE_ROUND_POST_SEC: float = 7.0
 const ONLINE_WAIT_TIMEOUT_SEC: float = 300.0
 const ONLINE_POINTS_TO_WIN: int = 7
 const SERVER_SNAPSHOT_INTERVAL_SEC: float = 0.05
+const DB_PATH: String = "user://redline_accounts_db.json"
+const INV_CASE_ITEM_PREFIX: String = "item_case_rainbow"
+const INV_SKIN_ITEM_PREFIX: String = "item_skin"
+const RAINBOW_COLOR_ORDER: Array[String] = ["red", "blue", "green", "yellow"]
+const AUTH_LOGIN_MAX: int = 24
+const AUTH_PASSWORD_MAX: int = 64
 
 @export var port: int = 2457
 
@@ -36,9 +42,13 @@ var server_wait_time_left: float = ONLINE_WAIT_TIMEOUT_SEC
 var server_match_winner: int = 0
 var server_snapshot_accum: float = 0.0
 var server_state_dirty: bool = false
+var account_db: Dictionary = {"users": {}}
+var peer_account_login: Dictionary = {}
 
 
 func _ready() -> void:
+	randomize()
+	_db_load()
 	var env_port := int(OS.get_environment("PORT"))
 	if env_port > 0:
 		port = env_port
@@ -71,13 +81,12 @@ func _on_peer_connected(id: int) -> void:
 			multiplayer.multiplayer_peer.disconnect_peer(id)
 		print("Peer rejected (max players reached): %d" % id)
 		return
-	_server_ensure_peer(id)
-	_server_mark_dirty()
-	print("Peer connected: %d" % id)
+	print("Peer connected (awaiting auth): %d" % id)
 
 
 func _on_peer_disconnected(id: int) -> void:
 	print("Peer disconnected: %d" % id)
+	peer_account_login.erase(id)
 	_server_drop_peer(id)
 	if _can_send_rpc_to_peers():
 		rpc("net_remove_peer", id)
@@ -86,6 +95,279 @@ func _on_peer_disconnected(id: int) -> void:
 
 func _server_mark_dirty() -> void:
 	server_state_dirty = true
+
+
+func _server_is_authenticated(peer_id: int) -> bool:
+	return peer_account_login.has(peer_id)
+
+
+func _hash_password(raw: String) -> String:
+	var ctx := HashingContext.new()
+	var err := ctx.start(HashingContext.HASH_SHA256)
+	if err != OK:
+		return raw
+	ctx.update(raw.to_utf8_buffer())
+	return ctx.finish().hex_encode()
+
+
+func _db_load() -> void:
+	account_db = {"users": {}}
+	if not FileAccess.file_exists(DB_PATH):
+		_db_save()
+		return
+	var f := FileAccess.open(DB_PATH, FileAccess.READ)
+	if f == null:
+		return
+	var txt := f.get_as_text()
+	if txt.strip_edges() == "":
+		_db_save()
+		return
+	var parsed: Variant = JSON.parse_string(txt)
+	if parsed is Dictionary:
+		var pd := parsed as Dictionary
+		if pd.has("users") and pd["users"] is Dictionary:
+			account_db = pd
+			return
+	_db_save()
+
+
+func _db_save() -> void:
+	var f := FileAccess.open(DB_PATH, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(JSON.stringify(account_db, "\t"))
+
+
+func _db_skin_weapon_from_id(skin_id: String) -> String:
+	if skin_id.begins_with("default_"):
+		var parts_d := skin_id.split("_")
+		return parts_d[1] if parts_d.size() == 2 else ""
+	if not skin_id.begins_with("rainbow_"):
+		return ""
+	var parts := skin_id.split("_")
+	if parts.size() != 3:
+		return ""
+	return parts[1]
+
+
+func _db_default_skin(weapon_id: String) -> String:
+	return "default_%s" % weapon_id
+
+
+func _db_inv_next_acq(inv: Dictionary) -> int:
+	var c := int(inv.get("acq_counter", 0)) + 1
+	inv["acq_counter"] = c
+	return c
+
+
+func _db_inv_add_skin_item(inv: Dictionary, skin_id: String) -> Dictionary:
+	var serial := int(inv.get("skin_serial", 0)) + 1
+	inv["skin_serial"] = serial
+	var item_id := "%s_%d" % [INV_SKIN_ITEM_PREFIX, serial]
+	var item := {
+		"id": item_id,
+		"skin_id": skin_id,
+		"acq": _db_inv_next_acq(inv)
+	}
+	var skins_v: Variant = inv.get("skins", [])
+	var skins: Array = skins_v if skins_v is Array else []
+	skins.append(item)
+	inv["skins"] = skins
+	return item
+
+
+func _db_inv_add_case_item(inv: Dictionary) -> Dictionary:
+	var serial := int(inv.get("case_serial", 0)) + 1
+	inv["case_serial"] = serial
+	var item_id := "%s_%d" % [INV_CASE_ITEM_PREFIX, serial]
+	var item := {
+		"id": item_id,
+		"acq": _db_inv_next_acq(inv)
+	}
+	var cases_v: Variant = inv.get("cases", [])
+	var cases: Array = cases_v if cases_v is Array else []
+	cases.append(item)
+	inv["cases"] = cases
+	return item
+
+
+func _db_inv_has_skin(inv: Dictionary, skin_id: String) -> bool:
+	var skins_v: Variant = inv.get("skins", [])
+	if not (skins_v is Array):
+		return false
+	for sv in (skins_v as Array):
+		if sv is Dictionary and str((sv as Dictionary).get("skin_id", "")) == skin_id:
+			return true
+	return false
+
+
+func _db_inv_consume_case(inv: Dictionary, case_item_id: String) -> bool:
+	var cases_v: Variant = inv.get("cases", [])
+	var cases: Array = cases_v if cases_v is Array else []
+	if cases.is_empty():
+		return false
+	var idx := -1
+	if case_item_id != "":
+		for i in range(cases.size()):
+			if cases[i] is Dictionary and str((cases[i] as Dictionary).get("id", "")) == case_item_id:
+				idx = i
+				break
+	if idx < 0:
+		var best_acq := -1
+		for i in range(cases.size()):
+			if not (cases[i] is Dictionary):
+				continue
+			var acq := int((cases[i] as Dictionary).get("acq", 0))
+			if acq > best_acq:
+				best_acq = acq
+				idx = i
+	if idx < 0 or idx >= cases.size():
+		return false
+	cases.remove_at(idx)
+	inv["cases"] = cases
+	return true
+
+
+func _db_roll_rainbow_drop_id() -> String:
+	var r := randf()
+	var weapon_id := "glock"
+	if r < 0.50:
+		weapon_id = "glock"
+	elif r < 0.85:
+		weapon_id = "ak"
+	else:
+		weapon_id = "knife"
+	var color_name := RAINBOW_COLOR_ORDER[randi_range(0, RAINBOW_COLOR_ORDER.size() - 1)]
+	return "rainbow_%s_%s" % [weapon_id, color_name]
+
+
+func _db_inv_sanitize_selected(inv: Dictionary) -> void:
+	var selected_v: Variant = inv.get("selected", {})
+	var selected: Dictionary = selected_v if selected_v is Dictionary else {}
+	for weapon_id in ["ak", "glock", "knife"]:
+		var wanted := str(selected.get(weapon_id, _db_default_skin(weapon_id)))
+		if wanted == "" or _db_skin_weapon_from_id(wanted) != weapon_id or not _db_inv_has_skin(inv, wanted):
+			wanted = _db_default_skin(weapon_id)
+		selected[weapon_id] = wanted
+	inv["selected"] = selected
+
+
+func _db_new_inventory() -> Dictionary:
+	var inv := {
+		"keys": 0,
+		"case_serial": 0,
+		"skin_serial": 0,
+		"acq_counter": 0,
+		"cases": [],
+		"skins": [],
+		"selected": {
+			"ak": "default_ak",
+			"glock": "default_glock",
+			"knife": "default_knife"
+		}
+	}
+	_db_inv_add_skin_item(inv, "default_ak")
+	_db_inv_add_skin_item(inv, "default_glock")
+	_db_inv_add_skin_item(inv, "default_knife")
+	_db_inv_sanitize_selected(inv)
+	return inv
+
+
+func _db_build_client_snapshot(inv: Dictionary) -> Dictionary:
+	var out_cases: Array[Dictionary] = []
+	var out_skins: Array[Dictionary] = []
+	var cases_v: Variant = inv.get("cases", [])
+	if cases_v is Array:
+		for cv in (cases_v as Array):
+			if cv is Dictionary:
+				out_cases.append({
+					"id": str((cv as Dictionary).get("id", "")),
+					"acq": int((cv as Dictionary).get("acq", 0))
+				})
+	var skins_v: Variant = inv.get("skins", [])
+	if skins_v is Array:
+		for sv in (skins_v as Array):
+			if sv is Dictionary:
+				out_skins.append({
+					"id": str((sv as Dictionary).get("id", "")),
+					"skin_id": str((sv as Dictionary).get("skin_id", "")),
+					"acq": int((sv as Dictionary).get("acq", 0))
+				})
+	out_cases.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a.get("acq", 0)) > int(b.get("acq", 0))
+	)
+	out_skins.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a.get("acq", 0)) > int(b.get("acq", 0))
+	)
+	var selected_v: Variant = inv.get("selected", {})
+	var selected: Dictionary = selected_v if selected_v is Dictionary else {}
+	return {
+		"keys": maxi(0, int(inv.get("keys", 0))),
+		"cases": out_cases,
+		"skins": out_skins,
+		"selected": {
+			"ak": str(selected.get("ak", "default_ak")),
+			"glock": str(selected.get("glock", "default_glock")),
+			"knife": str(selected.get("knife", "default_knife"))
+		}
+	}
+
+
+func _db_set_user(login: String, user: Dictionary) -> void:
+	var users: Dictionary = account_db.get("users", {})
+	users[login] = user
+	account_db["users"] = users
+
+
+func _db_get_user(login: String) -> Dictionary:
+	var users: Dictionary = account_db.get("users", {})
+	if not users.has(login):
+		return {}
+	var uv: Variant = users[login]
+	return uv if uv is Dictionary else {}
+
+
+func _server_apply_account_to_peer(peer_id: int) -> void:
+	if not _server_is_authenticated(peer_id):
+		return
+	var login := str(peer_account_login.get(peer_id, ""))
+	if login == "":
+		return
+	var user := _db_get_user(login)
+	if user.is_empty():
+		return
+	var inv_v: Variant = user.get("inv", {})
+	if not (inv_v is Dictionary):
+		return
+	var inv := inv_v as Dictionary
+	_db_inv_sanitize_selected(inv)
+	user["inv"] = inv
+	_db_set_user(login, user)
+	_db_save()
+	server_names[peer_id] = str(user.get("nick", server_names.get(peer_id, "P%d" % peer_id)))
+	if not server_states.has(peer_id):
+		_server_ensure_peer(peer_id)
+	var s: Dictionary = server_states[peer_id]
+	var selected := inv.get("selected", {}) as Dictionary
+	s["sel_ak"] = str(selected.get("ak", "default_ak"))
+	s["sel_glock"] = str(selected.get("glock", "default_glock"))
+	s["sel_knife"] = str(selected.get("knife", "default_knife"))
+	server_states[peer_id] = s
+
+
+func _server_push_account_sync(peer_id: int) -> void:
+	if not _server_is_authenticated(peer_id):
+		return
+	var login := str(peer_account_login.get(peer_id, ""))
+	if login == "":
+		return
+	var user := _db_get_user(login)
+	if user.is_empty():
+		return
+	var inv_v: Variant = user.get("inv", {})
+	if not (inv_v is Dictionary):
+		return
+	rpc_id(peer_id, "net_account_sync", _db_build_client_snapshot(inv_v as Dictionary))
 
 
 func _server_connected_ids_sorted() -> Array[int]:
@@ -259,7 +541,10 @@ func _server_ensure_peer(peer_id: int) -> void:
 		"glock_mags": 1,
 		"glock_reload_end": 0.0,
 		"ak_owned": false,
-		"glock_owned": true
+		"glock_owned": true,
+		"sel_ak": "default_ak",
+		"sel_glock": "default_glock",
+		"sel_knife": "default_knife"
 	}
 	server_names[peer_id] = "P%d" % peer_id
 	if not server_scores.has(peer_id):
@@ -475,6 +760,11 @@ func _server_build_snapshot() -> Dictionary:
 		s["opponents"] = opponents
 		s["points_to_win"] = ONLINE_POINTS_TO_WIN
 		s["match_winner"] = server_match_winner
+		s["selected_skins"] = {
+			"ak": str(s.get("sel_ak", "default_ak")),
+			"glock": str(s.get("sel_glock", "default_glock")),
+			"knife": str(s.get("sel_knife", "default_knife"))
+		}
 		snapshot[str(peer_id)] = s
 	return snapshot
 
@@ -605,32 +895,221 @@ func net_pong(_client_msec: int) -> void:
 @rpc("any_peer")
 func net_submit_profile(profile: Dictionary) -> void:
 	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
 	_server_set_name(sender, str(profile.get("nick", "Player")))
+	var login := str(peer_account_login.get(sender, ""))
+	if login != "":
+		var user := _db_get_user(login)
+		if not user.is_empty():
+			user["nick"] = str(server_names.get(sender, "Player"))
+			_db_set_user(login, user)
+			_db_save()
 	_server_mark_dirty()
 
 
 @rpc("any_peer", "unreliable")
 func net_submit_state(state: Dictionary) -> void:
 	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
 	_server_update_state(sender, state)
 
 
 @rpc("any_peer", "unreliable")
 func net_submit_shot(payload: Dictionary) -> void:
 	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
 	_server_handle_shot(sender, payload)
 
 
 @rpc("any_peer")
 func net_submit_buy(action_id: String) -> void:
 	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
 	_server_apply_buy(sender, action_id)
 
 
 @rpc("any_peer")
 func net_submit_reload(weapon_id: String) -> void:
 	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
 	_server_apply_reload(sender, weapon_id)
+
+
+@rpc("any_peer")
+func net_submit_auth(payload: Dictionary) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	var login := str(payload.get("login", "")).strip_edges().to_lower()
+	var password := str(payload.get("password", ""))
+	var create_mode := bool(payload.get("create", false))
+	var nick := str(payload.get("nick", "")).strip_edges()
+	if login == "" or password == "":
+		rpc_id(sender, "net_auth_result", false, "Brak loginu lub hasla.", {})
+		return
+	if login.length() > AUTH_LOGIN_MAX:
+		login = login.substr(0, AUTH_LOGIN_MAX)
+	if password.length() > AUTH_PASSWORD_MAX:
+		password = password.substr(0, AUTH_PASSWORD_MAX)
+	if password.length() < 3:
+		rpc_id(sender, "net_auth_result", false, "Haslo min. 3 znaki.", {})
+		return
+	for i in range(login.length()):
+		var ch := login.unicode_at(i)
+		var ok_char := (ch >= 48 and ch <= 57) or (ch >= 97 and ch <= 122) or ch == 95
+		if not ok_char:
+			rpc_id(sender, "net_auth_result", false, "Login: tylko a-z 0-9 _", {})
+			return
+	if login.length() < 3:
+		rpc_id(sender, "net_auth_result", false, "Login min. 3 znaki.", {})
+		return
+
+	var users: Dictionary = account_db.get("users", {})
+	var pass_hash := _hash_password(password)
+	if create_mode:
+		if users.has(login):
+			rpc_id(sender, "net_auth_result", false, "Konto juz istnieje.", {})
+			return
+		var user := {
+			"password_hash": pass_hash,
+			"nick": nick if nick != "" else login,
+			"inv": _db_new_inventory()
+		}
+		users[login] = user
+		account_db["users"] = users
+		_db_save()
+	else:
+		if not users.has(login):
+			rpc_id(sender, "net_auth_result", false, "Nie ma takiego konta.", {})
+			return
+		var user_v: Variant = users[login]
+		if not (user_v is Dictionary):
+			rpc_id(sender, "net_auth_result", false, "Uszkodzone konto.", {})
+			return
+		var user := user_v as Dictionary
+		if str(user.get("password_hash", "")) != pass_hash:
+			rpc_id(sender, "net_auth_result", false, "Zle haslo.", {})
+			return
+		if nick != "":
+			user["nick"] = nick
+			users[login] = user
+			account_db["users"] = users
+			_db_save()
+
+	peer_account_login[sender] = login
+	_server_ensure_peer(sender)
+	var final_nick := nick
+	if final_nick == "":
+		var auth_user := _db_get_user(login)
+		final_nick = str(auth_user.get("nick", login)) if not auth_user.is_empty() else login
+	_server_set_name(sender, final_nick)
+	_server_apply_account_to_peer(sender)
+	_server_mark_dirty()
+	var sync_snap := {}
+	var u := _db_get_user(login)
+	if not u.is_empty():
+		var inv_v: Variant = u.get("inv", {})
+		if inv_v is Dictionary:
+			sync_snap = _db_build_client_snapshot(inv_v as Dictionary)
+	rpc_id(sender, "net_auth_result", true, "OK", sync_snap)
+	_server_push_account_sync(sender)
+
+
+@rpc("any_peer")
+func net_submit_inventory_action(action_id: String) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
+	var login := str(peer_account_login.get(sender, ""))
+	if login == "":
+		return
+	var user := _db_get_user(login)
+	if user.is_empty():
+		return
+	var inv_v: Variant = user.get("inv", {})
+	if not (inv_v is Dictionary):
+		return
+	var inv := inv_v as Dictionary
+	match action_id:
+		"buy_case":
+			_db_inv_add_case_item(inv)
+		"buy_key":
+			inv["keys"] = maxi(0, int(inv.get("keys", 0)) + 1)
+		_:
+			return
+	user["inv"] = inv
+	_db_set_user(login, user)
+	_db_save()
+	_server_push_account_sync(sender)
+
+
+@rpc("any_peer")
+func net_submit_select_skin(weapon_id: String, skin_id: String) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
+	if not (weapon_id == "ak" or weapon_id == "glock" or weapon_id == "knife"):
+		return
+	var login := str(peer_account_login.get(sender, ""))
+	if login == "":
+		return
+	var user := _db_get_user(login)
+	if user.is_empty():
+		return
+	var inv_v: Variant = user.get("inv", {})
+	if not (inv_v is Dictionary):
+		return
+	var inv := inv_v as Dictionary
+	if _db_skin_weapon_from_id(skin_id) != weapon_id or not _db_inv_has_skin(inv, skin_id):
+		skin_id = _db_default_skin(weapon_id)
+	var selected_v: Variant = inv.get("selected", {})
+	var selected: Dictionary = selected_v if selected_v is Dictionary else {}
+	selected[weapon_id] = skin_id
+	inv["selected"] = selected
+	_db_inv_sanitize_selected(inv)
+	user["inv"] = inv
+	_db_set_user(login, user)
+	_db_save()
+	_server_apply_account_to_peer(sender)
+	_server_mark_dirty()
+	_server_push_account_sync(sender)
+
+
+@rpc("any_peer")
+func net_submit_open_case(case_item_id: String) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	if not _server_is_authenticated(sender):
+		return
+	var login := str(peer_account_login.get(sender, ""))
+	if login == "":
+		return
+	var user := _db_get_user(login)
+	if user.is_empty():
+		return
+	var inv_v: Variant = user.get("inv", {})
+	if not (inv_v is Dictionary):
+		return
+	var inv := inv_v as Dictionary
+	if int(inv.get("keys", 0)) <= 0:
+		rpc_id(sender, "net_case_open_result", false, "Brak klucza.", "")
+		return
+	if not _db_inv_consume_case(inv, case_item_id):
+		rpc_id(sender, "net_case_open_result", false, "Brak skrzynki.", "")
+		return
+	inv["keys"] = maxi(0, int(inv.get("keys", 0)) - 1)
+	var drop_skin_id := _db_roll_rainbow_drop_id()
+	_db_inv_add_skin_item(inv, drop_skin_id)
+	_db_inv_sanitize_selected(inv)
+	user["inv"] = inv
+	_db_set_user(login, user)
+	_db_save()
+	_server_apply_account_to_peer(sender)
+	_server_mark_dirty()
+	_server_push_account_sync(sender)
+	rpc_id(sender, "net_case_open_result", true, "", drop_skin_id)
 
 
 @rpc("authority", "call_local", "unreliable")
